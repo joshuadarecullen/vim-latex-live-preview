@@ -280,7 +280,7 @@ EEOOFF
             endif
         endfor
         echohl ErrorMsg
-        echo printf("vim-latex-live-preview: The defaults for % are not executable.", a:context)
+        echo printf("vim-latex-live-preview: The defaults for %s are not executable.", a:context)
         echohl None
         throw "End execution"
     endfunction
