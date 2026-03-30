@@ -160,6 +160,42 @@ hold (autocmd events `CursorHold` and `CursorHoldI`), use the feature flag:
 let g:livepreview_cursorhold_recompile = 0
 ```
 
+### Additional Commands
+
+| Command | Description |
+|---------|-------------|
+| `:LLPStop` | Stop the live preview |
+| `:LLPSyncForward` | Jump PDF to current cursor position (requires okular + synctex) |
+| `:LLPCursorTrackToggle` | Toggle automatic PDF sync as cursor moves |
+| `:LLPCompileErrors` | Compile and show errors in quickfix |
+| `:LLPClean` | Delete auxiliary files (.aux, .log, .toc, etc.) |
+| `:LLPCleanAll` | Clean auxiliary files + temp directory |
+| `:LLPWordCount` | Show word count (requires texcount) |
+| `:LLPWordCountVerbose` | Show detailed word count in split |
+| `:LLPLog` | View compilation log with error highlighting |
+| `:LLPLogToggle` | Toggle log viewer |
+| `:LLPSetupInverseSearch` | Show instructions for okular inverse search |
+
+### Additional Options
+
+```vim
+" Auto-sync PDF to cursor after save (default: 0)
+let g:livepreview_autosync = 1
+let g:livepreview_autosync_delay = 1500  " ms
+
+" Cursor tracking debounce delay (default: 200ms)
+let g:livepreview_cursor_track_delay = 200
+
+" Smart bib recompile - only run bibtex when .bib files change (default: 1)
+let g:livepreview_smart_bib = 1
+
+" Log viewer height (default: 15)
+let g:livepreview_log_height = 15
+
+" Custom auxiliary file extensions to clean
+let g:livepreview_aux_extensions = ['aux', 'log', 'toc', ...]
+```
+
 Known issues
 ------------
 

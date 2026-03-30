@@ -76,18 +76,29 @@ function! s:Compile()
     endif
 
     " Change directory to handle properly sourced files with \input and bib
-    " TODO: get rid of lcd
     execute 'lcd ' . b:livepreview_buf_data['root_dir']
 
     " Write the current buffer in a temporary file
     silent exec 'write! ' . b:livepreview_buf_data['tmp_src_file']
 
-    call s:RunInBackground(b:livepreview_buf_data['run_cmd'])
+    " Smart recompile: only run bib when .bib files changed
+    if s:BibFilesChanged() && has_key(b:livepreview_buf_data, 'run_bib_cmd')
+        call s:RunInBackground(b:livepreview_buf_data['run_cmd'] .
+            \ ' && ' . b:livepreview_buf_data['run_bib_cmd'] .
+            \ ' && ' . b:livepreview_buf_data['run_cmd'])
+    else
+        call s:RunInBackground(b:livepreview_buf_data['run_cmd'])
+    endif
 
     lcd -
 endfunction
 
 function! s:StartPreview(...)
+    " Prevent duplicate previews
+    if exists('b:livepreview_buf_data') && get(b:livepreview_buf_data, 'preview_running', 0)
+        echo 'Preview already running. Use :LLPStop to stop it first.'
+        return
+    endif
     let b:livepreview_buf_data = {}
 
     let b:livepreview_buf_data['py_exe'] = s:py_exe
@@ -316,11 +327,335 @@ unlet! s:init_msg
 
 command! -nargs=* LLPStartPreview call s:StartPreview(<f-args>)
 
+function! LLPStop()
+    if exists('b:livepreview_buf_data')
+        " Clean up temp directory
+        if has_key(b:livepreview_buf_data, 'tmp_dir')
+            let l:tmp = substitute(b:livepreview_buf_data['tmp_dir'], "^'\\|'$", '', 'g')
+            if isdirectory(l:tmp)
+                call delete(l:tmp, 'rf')
+            endif
+        endif
+        unlet b:livepreview_buf_data
+        echo 'Preview stopped'
+    else
+        echo 'No preview running'
+    endif
+endfunction
+
+command! LLPStop call LLPStop()
+
 if get(g:, 'livepreview_cursorhold_recompile', 1)
     autocmd CursorHold,CursorHoldI,BufWritePost * call s:Compile()
 else
     autocmd BufWritePost * call s:Compile()
 endif
+
+" Forward search: Jump PDF to current cursor position in tex file
+" Requires: okular, compilation with -synctex=1
+function! LLPSyncForward()
+    let l:line = line('.')
+    let l:col = col('.')
+    let l:tex_file = expand('%:p')
+
+    " Get PDF path from livepreview if running
+    if exists('b:livepreview_buf_data') && has_key(b:livepreview_buf_data, 'tmp_dir')
+        let l:tmp_dir = substitute(b:livepreview_buf_data['tmp_dir'], "^'\\|'$", '', 'g')
+        let l:root_dir = b:livepreview_buf_data['root_dir']
+        let l:pdf_file = l:tmp_dir . l:root_dir . '/' . expand('%:t:r') . '.pdf'
+        let l:tex_file = l:tmp_dir . expand('%:p:r')
+    else
+        let l:pdf_file = expand('%:p:r') . '.pdf'
+    endif
+
+    if !filereadable(l:pdf_file)
+        echohl WarningMsg
+        echo 'PDF not found: ' . l:pdf_file
+        echohl None
+        return
+    endif
+
+    " Okular forward search command (avoid double --unique if already in previewer)
+    let l:unique = s:previewer =~# '--unique' ? '' : '--unique '
+    let l:cmd = s:previewer . ' ' . l:unique . '"' . l:pdf_file . '#src:' . l:line . ' ' . l:tex_file . '"'
+    call s:RunInBackground(l:cmd)
+endfunction
+
+function! s:SyncForwardDelayed(timer)
+    call LLPSyncForward()
+endfunction
+
+" Compile LaTeX and show errors in quickfix
+function! LLPCompileErrors()
+    let l:tex_file = expand('%:p')
+    let l:tex_dir = expand('%:p:h')
+    write
+
+    let l:cmd = 'cd ' . shellescape(l:tex_dir) . ' && ' . s:engine . ' -file-line-error -interaction=nonstopmode ' . shellescape(l:tex_file) . ' 2>&1'
+    let l:output = system(l:cmd)
+
+    let l:errors = []
+    for l:line in split(l:output, '\n')
+        let l:match = matchlist(l:line, '^\([^:]*\.tex\):\(\d\+\):\s*\(.*\)$')
+        if !empty(l:match)
+            call add(l:errors, {
+                \ 'filename': l:tex_dir . '/' . l:match[1],
+                \ 'lnum': str2nr(l:match[2]),
+                \ 'text': l:match[3],
+                \ 'type': 'E'
+                \ })
+        endif
+    endfor
+
+    call setqflist(l:errors)
+    if empty(l:errors)
+        echo 'No errors found!'
+        cclose
+    else
+        copen
+    endif
+endfunction
+
+command! LLPSyncForward call LLPSyncForward()
+command! LLPCompileErrors call LLPCompileErrors()
+
+" Auto-sync after save (optional, controlled by g:livepreview_autosync)
+if get(g:, 'livepreview_autosync', 0)
+    autocmd BufWritePost *.tex call timer_start(get(g:, 'livepreview_autosync_delay', 1500), function('s:SyncForwardDelayed'))
+endif
+
+" Cursor tracking - PDF follows cursor position
+let s:cursor_track_enabled = 0
+let s:cursor_track_timer = -1
+let s:cursor_track_last_line = -1
+
+function! s:CursorTrackSync(timer)
+    let l:cur_line = line('.')
+    " Only sync if line changed and preview is running
+    if l:cur_line != s:cursor_track_last_line
+                \ && exists('b:livepreview_buf_data')
+                \ && get(b:livepreview_buf_data, 'preview_running', 0)
+        let s:cursor_track_last_line = l:cur_line
+        call LLPSyncForward()
+    endif
+endfunction
+
+function! s:CursorTrackHandler()
+    " Cancel pending timer
+    if s:cursor_track_timer != -1
+        call timer_stop(s:cursor_track_timer)
+    endif
+    " Start new debounced timer (default 200ms, configurable)
+    let l:delay = get(g:, 'livepreview_cursor_track_delay', 200)
+    let s:cursor_track_timer = timer_start(l:delay, function('s:CursorTrackSync'))
+endfunction
+
+function! LLPCursorTrackOn()
+    let s:cursor_track_enabled = 1
+    let s:cursor_track_last_line = -1
+    augroup LLPCursorTrack
+        autocmd!
+        autocmd CursorMoved,CursorMovedI *.tex call s:CursorTrackHandler()
+    augroup END
+    echo 'PDF cursor tracking ON'
+endfunction
+
+function! LLPCursorTrackOff()
+    let s:cursor_track_enabled = 0
+    if s:cursor_track_timer != -1
+        call timer_stop(s:cursor_track_timer)
+        let s:cursor_track_timer = -1
+    endif
+    augroup LLPCursorTrack
+        autocmd!
+    augroup END
+    echo 'PDF cursor tracking OFF'
+endfunction
+
+function! LLPCursorTrackToggle()
+    if s:cursor_track_enabled
+        call LLPCursorTrackOff()
+    else
+        call LLPCursorTrackOn()
+    endif
+endfunction
+
+command! LLPCursorTrackOn call LLPCursorTrackOn()
+command! LLPCursorTrackOff call LLPCursorTrackOff()
+command! LLPCursorTrackToggle call LLPCursorTrackToggle()
+
+" ============================================================================
+" Feature: Clean Auxiliary Files
+" ============================================================================
+let s:aux_extensions = ['aux', 'log', 'toc', 'lof', 'lot', 'bbl', 'blg', 'idx',
+    \ 'ilg', 'ind', 'out', 'synctex.gz', 'fls', 'fdb_latexmk', 'nav', 'snm',
+    \ 'vrb', 'bcf', 'run.xml', 'xdv']
+
+function! LLPClean(...)
+    let l:extensions = get(g:, 'livepreview_aux_extensions', s:aux_extensions)
+    let l:clean_dir = a:0 > 0 ? fnamemodify(a:1, ':p:h') :
+        \ (exists('b:livepreview_buf_data') && has_key(b:livepreview_buf_data, 'root_dir')
+        \ ? b:livepreview_buf_data['root_dir'] : expand('%:p:h'))
+    let l:base = expand('%:t:r')
+    let l:deleted = []
+    for ext in l:extensions
+        let l:file = l:clean_dir . '/' . l:base . '.' . ext
+        if filereadable(l:file) && delete(l:file) == 0
+            call add(l:deleted, l:base . '.' . ext)
+        endif
+    endfor
+    echo empty(l:deleted) ? 'No auxiliary files found' : 'Cleaned: ' . join(l:deleted, ', ')
+endfunction
+
+function! LLPCleanAll()
+    call LLPClean()
+    if exists('b:livepreview_buf_data') && has_key(b:livepreview_buf_data, 'tmp_dir')
+        let l:tmp = substitute(b:livepreview_buf_data['tmp_dir'], "^'\\|'$", '', 'g')
+        if isdirectory(l:tmp)
+            call delete(l:tmp, 'rf')
+            echo ' + temp directory'
+        endif
+    endif
+endfunction
+
+command! -nargs=? -complete=dir LLPClean call LLPClean(<f-args>)
+command! LLPCleanAll call LLPCleanAll()
+
+" ============================================================================
+" Feature: Word Count
+" ============================================================================
+function! LLPWordCount()
+    let l:cmd = get(g:, 'livepreview_texcount_cmd', 'texcount')
+    if !executable(l:cmd)
+        echohl ErrorMsg | echo 'texcount not found (install texlive-extra-utils)' | echohl None
+        return
+    endif
+    if &modified | silent write | endif
+    let l:opts = get(g:, 'livepreview_texcount_opts', '-merge -q')
+    let l:output = system(l:cmd . ' ' . l:opts . ' ' . shellescape(expand('%:p')))
+    let l:words = matchstr(l:output, '\d\+')
+    echo empty(l:words) ? l:output : 'Words: ' . l:words
+    return l:words
+endfunction
+
+function! LLPWordCountVerbose()
+    let l:cmd = get(g:, 'livepreview_texcount_cmd', 'texcount')
+    if !executable(l:cmd)
+        echohl ErrorMsg | echo 'texcount not found' | echohl None
+        return
+    endif
+    if &modified | silent write | endif
+    let l:output = system(l:cmd . ' -merge ' . shellescape(expand('%:p')))
+    botright new
+    setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+    silent put =l:output
+    1delete _
+    resize 15
+    setlocal nomodifiable
+endfunction
+
+command! LLPWordCount call LLPWordCount()
+command! LLPWordCountVerbose call LLPWordCountVerbose()
+
+" ============================================================================
+" Feature: Log Viewer
+" ============================================================================
+function! s:GetLogFile()
+    if exists('b:livepreview_buf_data') && has_key(b:livepreview_buf_data, 'tmp_dir')
+        let l:tmp = substitute(b:livepreview_buf_data['tmp_dir'], "^'\\|'$", '', 'g')
+        let l:root = b:livepreview_buf_data['root_dir']
+        return l:tmp . l:root . '/' . expand('%:t:r') . '.log'
+    endif
+    return expand('%:p:r') . '.log'
+endfunction
+
+function! LLPLog()
+    let l:log = s:GetLogFile()
+    if !filereadable(l:log)
+        echohl WarningMsg | echo 'Log not found: ' . l:log | echohl None
+        return
+    endif
+    let l:height = get(g:, 'livepreview_log_height', 15)
+    let l:bufname = 'LLPLog:' . expand('%:t:r')
+    let l:existing = bufwinnr(l:bufname)
+    if l:existing != -1
+        execute l:existing . 'wincmd w'
+        setlocal modifiable
+        %delete _
+        execute 'read ' . fnameescape(l:log)
+        1delete _
+    else
+        execute 'botright ' . l:height . 'split'
+        execute 'edit ' . fnameescape(l:log)
+        execute 'file ' . l:bufname
+        setlocal buftype=nofile bufhidden=wipe noswapfile nowrap
+    endif
+    setlocal nomodifiable
+    " Highlight errors and warnings
+    syntax match LLPLogError /^!.*/
+    syntax match LLPLogWarning /\vWarning:|LaTeX Warning/
+    highlight link LLPLogError ErrorMsg
+    highlight link LLPLogWarning WarningMsg
+    call search('\v^!|Warning:', 'w')
+endfunction
+
+function! LLPLogToggle()
+    let l:bufname = 'LLPLog:' . expand('%:t:r')
+    let l:win = bufwinnr(l:bufname)
+    if l:win != -1
+        execute l:win . 'wincmd c'
+    else
+        call LLPLog()
+    endif
+endfunction
+
+command! LLPLog call LLPLog()
+command! LLPLogToggle call LLPLogToggle()
+
+" ============================================================================
+" Feature: Inverse Search Setup
+" ============================================================================
+function! LLPSetupInverseSearch()
+    let l:server = get(g:, 'livepreview_servername', v:servername)
+    if empty(l:server)
+        let l:server = 'VIM'
+    endif
+    let l:cmd = 'vim --servername ' . l:server . ' --remote-silent +%l %f'
+    echo 'Configure okular for inverse search:'
+    echo '  Settings -> Configure Okular -> Editor'
+    echo '  Set: Custom Text Editor'
+    echo '  Command: ' . l:cmd
+    echo ''
+    echo 'Start vim with: vim --servername ' . l:server
+    echo 'Current servername: ' . (empty(v:servername) ? '(none)' : v:servername)
+endfunction
+
+command! LLPSetupInverseSearch call LLPSetupInverseSearch()
+
+" ============================================================================
+" Feature: Smart Recompile (only run bib when .bib files change)
+" ============================================================================
+let s:bib_mtimes = {}
+
+function! s:BibFilesChanged()
+    if !get(g:, 'livepreview_smart_bib', 1)
+        return 1
+    endif
+    if !exists('b:livepreview_buf_data') || !has_key(b:livepreview_buf_data, 'root_dir')
+        return 0
+    endif
+    let l:root = b:livepreview_buf_data['root_dir']
+    let l:bibs = split(globpath(l:root, '**/*.bib', 1), "\n")
+    let l:changed = 0
+    for l:bib in l:bibs
+        let l:mtime = getftime(l:bib)
+        if l:mtime != get(s:bib_mtimes, l:bib, 0)
+            let s:bib_mtimes[l:bib] = l:mtime
+            let l:changed = 1
+        endif
+    endfor
+    return l:changed
+endfunction
 
 let &cpo = s:saved_cpo
 unlet! s:saved_cpo
